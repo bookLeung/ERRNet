@@ -32,6 +32,108 @@ class GradientLoss(nn.Module):
         return self.loss(predict_gradx, target_gradx) + self.loss(predict_grady, target_grady)
 
 
+class ExclusionLoss(nn.Module):
+    """Gradient exclusion loss: minimize correlation between transmission
+    and reflection gradients to enforce edge separation between layers.
+
+    T_hat: predicted transmission (from forward)
+    R_hat: predicted reflection (= input - T_hat)
+    """
+    def forward(self, trans, refl):
+        # x-direction gradients: [B, C, H, W-1]
+        grad_tx = trans[..., 1:, :] - trans[..., :-1, :]
+        grad_rx = refl[..., 1:, :] - refl[..., :-1, :]
+        # y-direction gradients: [B, C, H-1, W]
+        grad_ty = trans[..., 1:] - trans[..., :-1]
+        grad_ry = refl[..., 1:] - refl[..., :-1]
+
+        # crop to common spatial size [B, C, H-1, W-1]
+        grad_tx = grad_tx[..., :-1]
+        grad_rx = grad_rx[..., :-1]
+        grad_ty = grad_ty[..., :-1, :]
+        grad_ry = grad_ry[..., :-1, :]
+
+        # per-pixel gradient norm
+        norm_t = torch.sqrt(grad_tx ** 2 + grad_ty ** 2 + 1e-6)
+        norm_r = torch.sqrt(grad_rx ** 2 + grad_ry ** 2 + 1e-6)
+
+        # normalized gradient correlation (cosine similarity of gradient directions)
+        loss_x = torch.abs(grad_tx * grad_rx) / (norm_t * norm_r + 1e-6)
+        loss_y = torch.abs(grad_ty * grad_ry) / (norm_t * norm_r + 1e-6)
+
+        return (loss_x + loss_y).mean()
+
+
+class SSIMLoss(nn.Module):
+    """1 - SSIM loss. Simplified implementation using average pooling as
+    a Gaussian window approximation (window_size=11)."""
+    def __init__(self, window_size=11):
+        super().__init__()
+        self.window_size = window_size
+        self.pool = nn.AvgPool2d(window_size, stride=1)
+
+    def forward(self, predict, target):
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+
+        mu_x = self.pool(predict)
+        mu_y = self.pool(target)
+
+        sigma_x = self.pool(predict ** 2) - mu_x ** 2
+        sigma_y = self.pool(target ** 2) - mu_y ** 2
+        sigma_xy = self.pool(predict * target) - mu_x * mu_y
+
+        ssim = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / \
+               ((mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2))
+
+        return (1 - ssim).mean()
+
+
+class EdgeAwareLoss(nn.Module):
+    """Edge-aware L1 loss with gradient term — penalizes errors in edge
+    regions more heavily to improve fine structure preservation.
+
+    Uses a pre-computed edge map (from the EdgeMap module) as spatial
+    weights for both:
+      - pixel-level L1:  mean((1 + α · edge) ⊙ |pred - target|)
+      - gradient L1:     mean((1 + α · edge) ⊙ (|∇x_err| + |∇y_err|))
+
+    Args:
+        alpha: edge weight multiplier (higher = more edge emphasis)
+        grad_weight: relative weight of gradient term vs pixel term
+    """
+    def __init__(self, alpha=2.0, grad_weight=0.5):
+        super().__init__()
+        self.alpha = alpha
+        self.grad_weight = grad_weight
+
+    def forward(self, predict, target, edge_map):
+        # edge_map: [B, 1, H, W], values in [0, ~2] depending on image intensity
+        weight = 1.0 + self.alpha * edge_map
+
+        # --- pixel L1 with edge weighting ---
+        pixel_diff = (predict - target).abs()          # [B, C, H, W]
+        loss_pixel = (pixel_diff * weight).mean()
+
+        # --- gradient L1 with edge weighting ---
+        pred_grad_x = predict[..., 1:, :] - predict[..., :-1, :]
+        pred_grad_y = predict[..., 1:] - predict[..., :-1]
+        targ_grad_x = target[..., 1:, :] - target[..., :-1, :]
+        targ_grad_y = target[..., 1:] - target[..., :-1]
+
+        # crop weight to match gradient size
+        # grad_x: gradient along H dim, shape [B, C, H-1, W]
+        # grad_y: gradient along W dim, shape [B, C, H, W-1]
+        w_grad_x = weight[..., :-1, :]                 # [B, 1, H-1, W]
+        w_grad_y = weight[..., :-1]                    # [B, 1, H, W-1]
+
+        loss_grad_x = ((pred_grad_x - targ_grad_x).abs() * w_grad_x).mean()
+        loss_grad_y = ((pred_grad_y - targ_grad_y).abs() * w_grad_y).mean()
+        loss_grad = loss_grad_x + loss_grad_y
+
+        return loss_pixel + self.grad_weight * loss_grad
+
+
 class MultipleLoss(nn.Module):
     def __init__(self, losses, weight=None):
         super(MultipleLoss, self).__init__()
@@ -259,6 +361,18 @@ def init_loss(opt, tensor):
 
     loss_dic['t_pixel'] = pixel_loss
     loss_dic['r_pixel'] = pixel_loss
+
+    # --- improved losses ---
+    if getattr(opt, 'lambda_exclusion', 0) > 0:
+        exclusion_loss = ContentLoss()
+        exclusion_loss.initialize(ExclusionLoss())
+        loss_dic['exclusion'] = exclusion_loss
+
+    if getattr(opt, 'lambda_ssim', 0) > 0:
+        ssim_loss = ContentLoss()
+        ssim_loss.initialize(SSIMLoss())
+        loss_dic['ssim'] = ssim_loss
+    # -----------------------
 
     if opt.lambda_gan > 0:
         if opt.gan_type == 'sgan' or opt.gan_type == 'gan':

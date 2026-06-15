@@ -1,79 +1,131 @@
-# ERRNet
+# ERRNet: Single Image Reflection Removal — DIP26 Course Project
 
-The implementation of CVPR 2019 paper "[Single Image Reflection Removal Exploiting Misaligned Training Data and Network Enhancements](https://arxiv.org/abs/1904.00637)"
+基于 ERRNet (CVPR 2019) 的单图像反射去除改进策略研究。复现 baseline 并系统尝试 5 个改进方向，在 6 个公开测试集 + 5 张自拍照片上评估。
 
-*News* (19/09/2019): Fix the broken link; our pretrained model and collected unaligned dataset are now available at [OneDrive](https://1drv.ms/f/s!AqddfvhavTRih3n3W0P29cxVIlfM)   
+> 原论文: [Single Image Reflection Removal Exploiting Misaligned Training Data and Network Enhancements](https://arxiv.org/abs/1904.00637)
+>
+> Fork from: https://github.com/innerway-xq/ERRNet
 
-## Highlights
+## 环境
 
-* Our network can extract the background image layer devoid of reflection artifacts, as in the example:
+- PyTorch 2.7.0, torchvision 0.22.0
+- opencv-python-headless, scikit-image, h5py, tensorboardX, visdom
+- 硬件: PPU-ZW810E (98GB), 需 `source /usr/local/PPU_SDK/envsetup.sh ppu`
 
-<img src="imgs/animation2.gif" height="140px"/> <img src="imgs/animation1.gif" height="140px"/> 
+## 数据准备
 
-* We captured a new dataset containing 450 unaligned image pairs that are considerably easier to collect.
-Image samples from our unaligned dataset are shown below:
+```bash
+# 原始数据软链接
+ln -s /mnt/dip26-raw-data/errnet_dip26/ERRNet/checkpoints checkpoints
+ln -s /mnt/dip26-raw-data/errnet_dip26/ERRNet/datasets/raw_data datasets/raw_data
 
-<img src="imgs/unaligned1.gif" height="140px"/> <img src="imgs/datacollection_ours.jpg" height="140px"/>  <img src="imgs/unaligned2.gif" height="140px"/> 
-
-* We introduce a simple but powerful alignment-invariant loss function to facilitate exploiting misaligned real-world training data. Finetuning on unaligned image pairs with our loss leads to sharp and reflection-free results, in contrast to the blurry ones when using a conventional pixel-wise loss (L1, L2, e.t.c.). The resulting images finetuned by different losses are shown below: (Left: Pixel-wise loss; Right: Ours)
-
-<img src="imgs/unaligned_pixel.gif" height="140px"/> <img src="imgs/unaligned_ours.gif" height="140px"/>   
-
-
-## Prerequisites
-* Python >=3.5, PyTorch >= 0.4.1
-* Requirements: opencv-python, tensorboardX, visdom
-* Platforms: Ubuntu 16.04, cuda-8.0
-
-
-## Quick Start
-### 1. Preparing your training/testing datasets
-
-#### Training dataset
-* 7,643 cropped images with size 224 × 224 from
-  [Pascal VOC dataset](http://host.robots.ox.ac.uk/pascal/VOC/) (image ids are provided in VOC2012_224_train_png.txt, you should crop the center region with size 224 x 224 to reproduce our result). 
-
-* 90 real-world training images from [Berkeley real dataset](https://github.com/ceciliavision/perceptual-reflection-removal) 
-
-#### Testing dataset
-* 100 synthetic testing images from [CEILNet dataset](https://github.com/fqnchina/CEILNet) (testdata_reflection_synthetic_table2) 
-* 20 real testing images from [Berkeley real dataset](https://github.com/ceciliavision/perceptual-reflection-removal).  
-* Three sub-datasets, namely ‘Objects’, ‘Postcard’, ‘Wild’ from [SIR^2 dataset](https://sir2data.github.io/)
-
-Once the data are downloaded, you must organize the dataset according to our code implementation (see the source code of datasets.CEILDataset, e.t.c.)
-
-
-### 2. Playing with aligned data
-
-#### Testing
- * Download our pretrained model from [OneDrive](https://1drv.ms/f/s!AqddfvhavTRih3n3W0P29cxVIlfM) and move ```errnet_060_00463920.pt``` to ```checkpoints/errnet/```. 
- * Evaluate the model performance by ```python test_errnet.py --name errnet -r --icnn_path checkpoints/errnet/errnet_060_00463920.pt --hyper```
-
-#### Training
-* Reproduce our results by ```python train_errnet.py --name errnet --hyper``` 
-* Check ```options/errnet/train_options.py``` to see more training options. 
-
-### 3. Playing with unaligned data
-* Reproduce our finetuned model by ```python train_errnet_unaligned.py --name errnet_unaligned_ft --hyper -r --icnn_path checkpoints/errnet/errnet_060_00463920.pt --unaligned_loss vgg```
-
-## Citation
-
-If you find our code helpful in your research or work please cite our paper.
-
-```bibtex
- @inproceedings{wei2019single,
-   title={Single Image Reflection Removal Exploiting Misaligned Training Data and Network Enhancements},
-   author={Wei, Kaixuan and Yang, Jiaolong and Fu, Ying and David, Wipf and Huang, Hua},
-   booktitle={IEEE Conference on Computer Vision and Pattern Recognition},
-   year={2019},
- }
+# 生成训练/测试数据
+python datasets/prepare_test_data.py
+python datasets/prepare_train_data.py
 ```
 
-## Contact
-If you find any problem, please feel free to contact me (kaixuan.wei at kaust.edu.sa).
-A brief self-introduction is required, if you would like to get an in-depth help from me. 
+## 训练
 
-## Acknowledgments
-* Our code architecture is inspired by [CycleGAN](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix) and [EDSR](https://github.com/thstkdgus35/EDSR-PyTorch). 
+### Baseline（60 epoch, ~7–8h）
 
-* Special thanks to [@fqnchina](https://github.com/fqnchina) and [@ceciliavision](https://github.com/ceciliavision) for some discussions of this work. 
+```bash
+python train_errnet.py --name errnet_baseline --hyper --gpu_ids 0 --nThreads 0
+```
+
+### 微调（从 baseline checkpoint）
+
+```bash
+# Edge-Aware Loss
+python train_errnet_finetune.py --name errnet_edge_only --hyper --gpu_ids 0 \
+    --icnn_path checkpoints/errnet_baseline/errnet_060_00463920.pt \
+    --lambda_edge 0.05 --nThreads 0
+
+# CBAM Attention
+python train_errnet_finetune.py --name errnet_cbam --hyper --gpu_ids 0 \
+    --inet errnet_cbam \
+    --icnn_path checkpoints/errnet_baseline/errnet_060_00463920.pt
+
+# Exclusion Loss
+python train_errnet_finetune.py --name errnet_excl --hyper --gpu_ids 0 \
+    --icnn_path checkpoints/errnet_baseline/errnet_060_00463920.pt \
+    --lambda_exclusion 0.01 --nThreads 0
+
+# SSIM Loss
+python train_errnet_finetune.py --name errnet_ssim --hyper --gpu_ids 0 \
+    --icnn_path checkpoints/errnet_baseline/errnet_060_00463920.pt \
+    --lambda_ssim 0.1 --nThreads 0
+
+# Predict R̂
+python train_errnet_finetune.py --name errnet_predict_r --hyper --gpu_ids 0 \
+    --icnn_path checkpoints/errnet_baseline/errnet_060_00463920.pt \
+    --predict_reflection --lambda_exclusion 0.01 --lambda_ssim 0.1 --lambda_r_pixel 0.5
+```
+
+## 评估
+
+```bash
+python test_errnet.py --name <exp_name> --hyper --gpu_ids 0 --which_epoch latest
+```
+
+## 模型权重
+
+- **百度网盘**: https://pan.baidu.com/s/1n67vzXjwMCZPL3W40yZ-Fw?pwd=dipz 提取码: dipz
+- 包含: Baseline (`errnet_060_00463920.pt`) + Edge-Aware (`errnet_latest.pt`)
+
+## 主要结果
+
+### Baseline 复现
+
+| 数据集 | PSNR (Ours) | PSNR (Pretrained) |
+|--------|:---:|:---:|
+| CEILNet Table2 | **28.10** | 27.88 |
+| real20 | **23.63** | 23.55 |
+| postcard | 21.51 | 22.07 |
+| objects | 24.40 | 24.85 |
+| wild | **25.41** | 25.18 |
+| sir2_withgt | 23.53 | 23.88 |
+
+### 改进方向汇总
+
+| 方向 | 类别 | 结果 |
+|------|------|------|
+| Exclusion Loss | Loss | ▼ 全面下降（数学退化） |
+| SSIM Loss | Loss | ▼ 全面下降 |
+| Edge-Aware Loss | Loss | 3 升 3 降，无一致性 |
+| CBAM Attention | 架构 | 仅 wild 提升 |
+| Predict R̂ | 语义 | ▼▼ 灾难性退化 |
+
+**核心发现**: 所有改进方向均未在 6 个测试集上取得一致提升。VGG Perceptual Loss 梯度主导（~90%）、ERRNet 单输出架构的根本约束、以及微调训练不足是三条共性失败根因。
+
+### 自拍照片测试
+
+5 张现实玻璃反射场景照片，无配对 GT，定性分析。可视化结果见 `results/mypic/visualizations/`。
+
+## 文件结构
+
+```
+├── models/
+│   ├── arch/__init__.py          # 网络工厂（含 errnet_cbam）
+│   ├── arch/default.py           # DRNet, SE, CBAM, EdgeMap
+│   ├── errnet_model.py           # 主模型（baseline + 全部改进）
+│   └── losses.py                 # Exclusion, SSIM, EdgeAware Loss
+├── options/errnet/train_options.py  # 训练参数
+├── train_errnet.py               # 从头训练脚本
+├── train_errnet_finetune.py      # 微调脚本（从 checkpoint）
+├── test_errnet.py                # 评估脚本
+├── visualize_mypic.py            # 自拍照片可视化
+├── mypic/                        # 5 张自拍原始照片
+└── results/mypic/
+    ├── mypic_baseline/           # Baseline 模型输出
+    ├── mypic_edge/               # Edge-Aware 模型输出
+    └── visualizations/           # 并排对比图 + 残差图
+```
+
+## 参考
+
+- [1] Li & Brown, "Single Image Layer Separation Using Relative Smoothness", CVPR 2014.
+- [2] Fan et al., "A Generic Deep Architecture for Single Image Reflection Removal and Smoothing", ICCV 2017.
+- [3] Zhang et al., "Single Image Reflection Separation with Perceptual Losses", CVPR 2018.
+- [4] Wei et al., "Single Image Reflection Removal Exploiting Misaligned Training Data and Network Enhancements", CVPR 2019.
+- [5] Woo et al., "CBAM: Convolutional Block Attention Module", ECCV 2018.
+- [6] Wan et al., "Benchmarking Single-Image Reflection Removal Algorithms", ICCV 2017.

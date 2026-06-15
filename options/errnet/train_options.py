@@ -39,5 +39,16 @@ class TrainOptions(BaseOptions):
         
         self.parser.add_argument('--lambda_gan', type=float, default=0.01, help='weight for gan loss')
         self.parser.add_argument('--lambda_vgg', type=float, default=0.1, help='weight for vgg loss')
-        
+        self.parser.add_argument('--lambda_exclusion', type=float, default=0, help='weight for exclusion loss')
+        self.parser.add_argument('--lambda_ssim', type=float, default=0, help='weight for SSIM loss')
+        self.parser.add_argument('--lambda_edge', type=float, default=0, help='weight for edge-aware loss')
+        self.parser.add_argument('--edge_alpha', type=float, default=2.0, help='edge multiplier in edge-aware loss (higher=more edge emphasis)')
+        self.parser.add_argument('--edge_grad_weight', type=float, default=0.5, help='gradient term weight in edge-aware loss')
+
+        # residual-based reflection prediction (predict R̂, derive T̂ = input - R̂)
+        self.parser.add_argument('--predict_reflection', action='store_true',
+            help='If set, net_i predicts reflection R̂ and T̂ = input - R̂ (residual mode).')
+        self.parser.add_argument('--lambda_r_pixel', type=float, default=0.5,
+            help='L1 weight for direct R̂ supervision on synthetic data (only used when --predict_reflection).')
+
         self.isTrain = True

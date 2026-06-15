@@ -44,9 +44,90 @@ class SELayer(nn.Module):
         return x * y        
      
 
+class ChannelAttention(nn.Module):
+    """Channel Attention Module for CBAM.
+
+    Uses both average-pooling and max-pooling (unlike SE which only uses
+    average-pooling), sharing a bottleneck MLP. The pooled descriptors are
+    summed element-wise before sigmoid.
+
+    Args:
+        channel: Number of input channels.
+        reduction: Reduction ratio for the bottleneck (default: 16).
+    """
+
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        avg_out = self.fc(self.avg_pool(x).view(b, c))
+        max_out = self.fc(self.max_pool(x).view(b, c))
+        out = self.sigmoid(avg_out + max_out)
+        return x * out.view(b, c, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    """Spatial Attention Module for CBAM.
+
+    Computes a 2D spatial attention map by aggregating channel information
+    via average-pooling and max-pooling along the channel axis, concatenating
+    the results, and passing through a 7×7 convolution.
+
+    Args:
+        kernel_size: Size of the convolution kernel (default: 7).
+    """
+
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv(x_cat)
+        return self.sigmoid(out)
+
+
+class CBAMLayer(nn.Module):
+    """Convolutional Block Attention Module (CBAM).
+
+    Sequentially applies channel attention then spatial attention to the
+    input feature map. This is a drop-in upgrade over SELayer — it adds
+    spatial attention on top of enhanced channel attention.
+
+    Reference: Woo et al., "CBAM: Convolutional Block Attention Module", ECCV 2018.
+
+    Args:
+        channel: Number of input channels.
+        reduction: Reduction ratio for channel attention bottleneck (default: 16).
+        spatial_kernel: Kernel size for spatial attention conv (default: 7).
+    """
+
+    def __init__(self, channel, reduction=16, spatial_kernel=7):
+        super().__init__()
+        self.channel_attention = ChannelAttention(channel, reduction)
+        self.spatial_attention = SpatialAttention(spatial_kernel)
+
+    def forward(self, x):
+        x = self.channel_attention(x)
+        x = x * self.spatial_attention(x)
+        return x
+
+
 class DRNet(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, n_feats, n_resblocks, norm=nn.BatchNorm2d, 
-    se_reduction=None, res_scale=1, bottom_kernel_size=3, pyramid=False):
+    def __init__(self, in_channels, out_channels, n_feats, n_resblocks, norm=nn.BatchNorm2d,
+    se_reduction=None, cbam_reduction=None, res_scale=1, bottom_kernel_size=3, pyramid=False):
         super(DRNet, self).__init__()
         # Initial convolution layers
         conv = nn.Conv2d
@@ -62,8 +143,8 @@ class DRNet(torch.nn.Module):
         dilation_config = [1] * n_resblocks
 
         self.res_module = nn.Sequential(*[ResidualBlock(
-            n_feats, dilation=dilation_config[i], norm=norm, act=act, 
-            se_reduction=se_reduction, res_scale=res_scale) for i in range(n_resblocks)])
+            n_feats, dilation=dilation_config[i], norm=norm, act=act,
+            se_reduction=se_reduction, cbam_reduction=cbam_reduction, res_scale=res_scale) for i in range(n_resblocks)])
 
         # Upsampling Layers
         self.deconv1 = ConvLayer(deconv, n_feats, n_feats, kernel_size=4, stride=2, padding=1, norm=norm, act=act)
@@ -105,21 +186,26 @@ class ConvLayer(torch.nn.Sequential):
 
 
 class ResidualBlock(torch.nn.Module):
-    def __init__(self, channels, dilation=1, norm=nn.BatchNorm2d, act=nn.ReLU(True), se_reduction=None, res_scale=1):
+    def __init__(self, channels, dilation=1, norm=nn.BatchNorm2d, act=nn.ReLU(True), se_reduction=None, cbam_reduction=None, res_scale=1):
         super(ResidualBlock, self).__init__()
         conv = nn.Conv2d
         self.conv1 = ConvLayer(conv, channels, channels, kernel_size=3, stride=1, dilation=dilation, norm=norm, act=act)
         self.conv2 = ConvLayer(conv, channels, channels, kernel_size=3, stride=1, dilation=dilation, norm=norm, act=None)
         self.se_layer = None
+        self.cbam_layer = None
         self.res_scale = res_scale
-        if se_reduction is not None:
+        if cbam_reduction is not None:
+            self.cbam_layer = CBAMLayer(channels, cbam_reduction)
+        elif se_reduction is not None:
             self.se_layer = SELayer(channels, se_reduction)
 
     def forward(self, x):
         residual = x
         out = self.conv1(x)
         out = self.conv2(out)
-        if self.se_layer:
+        if self.cbam_layer:
+            out = self.cbam_layer(out)
+        elif self.se_layer:
             out = self.se_layer(out)
         out = out * self.res_scale
         out = out + residual

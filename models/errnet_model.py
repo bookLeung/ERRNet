@@ -104,9 +104,10 @@ class ERRNetBase(BaseModel):
                 target_r = target_r.to(device=self.gpu_ids[0])                
         
         self.input = input
-        
+
         self.input_edge = self.edge_map(self.input)
         self.target_t = target_t
+        self.target_r = target_r          # GT reflection (only meaningful on synthetic data)
         self.data_name = data_name
 
         self.issyn = not _flag_enabled(data, 'real', default=False)
@@ -123,7 +124,14 @@ class ERRNetBase(BaseModel):
         with torch.no_grad():
             self.forward()
 
-            output_i = tensor2im(self.output_i)
+            # In predict_reflection mode, the user-facing transmission is T̂ = input - R̂
+            # (already shape-aligned and stored in self.output_t).
+            # tensor2im already clamps to [0,1].
+            if getattr(self.opt, 'predict_reflection', False):
+                out_t = self.output_t.clamp(0, 1)
+            else:
+                out_t = self.output_i
+            output_i = tensor2im(out_t)
             target = tensor2im(self.target_t)
 
             if self.aligned:
@@ -168,8 +176,13 @@ class ERRNetBase(BaseModel):
                 return 
         
         with torch.no_grad():
-            output_i = self.forward()
-            output_i = tensor2im(output_i)
+            self.forward()
+            # In predict_reflection mode, save the derived transmission T̂.
+            if getattr(self.opt, 'predict_reflection', False):
+                out_t = self.output_t.clamp(0, 1)
+            else:
+                out_t = self.output_i
+            output_i = tensor2im(out_t)
                 # if os.path.exists(join(savedir, name,'t_output.png')):
                 #     i = 2
                 #     while True:
@@ -243,12 +256,24 @@ class ERRNetModel(ERRNetBase):
 
             self.loss_dic['t_cx'] = cxloss
 
+            # --- edge-aware loss (uses 3-arg signature, not ContentLoss) ---
+            self.edge_aware_loss = None
+            if getattr(opt, 'lambda_edge', 0) > 0:
+                self.edge_aware_loss = losses.EdgeAwareLoss(
+                    alpha=getattr(opt, 'edge_alpha', 2.0),
+                    grad_weight=getattr(opt, 'edge_grad_weight', 0.5),
+                ).to(self.device)
+            # ------------------------------------------------------------
+
             # Define discriminator
-            # if self.opt.lambda_gan > 0:
-            self.netD = networks.define_D(opt, 3)
-            self.optimizer_D = torch.optim.Adam(self.netD.parameters(),
-                                            lr=opt.lr, betas=(0.9, 0.999))
-            self._init_optimizer([self.optimizer_D])
+            if self.opt.lambda_gan > 0:
+                self.netD = networks.define_D(opt, 3)
+                self.optimizer_D = torch.optim.Adam(self.netD.parameters(),
+                                                lr=opt.lr, betas=(0.9, 0.999))
+                self._init_optimizer([self.optimizer_D])
+            else:
+                self.netD = None
+                self.optimizer_D = None
 
             # initialize optimizers
             self.optimizer_G = torch.optim.Adam(self.net_i.parameters(), 
@@ -256,9 +281,9 @@ class ERRNetModel(ERRNetBase):
 
             self._init_optimizer([self.optimizer_G])
 
-        if opt.resume:
+        if opt.resume or opt.icnn_path is not None:
             self.load(self, opt.resume_epoch)
-        
+
         if opt.no_verbose is False:
             self.print_network()
 
@@ -267,39 +292,70 @@ class ERRNetModel(ERRNetBase):
             p.requires_grad = True
 
         self.loss_D, self.pred_fake, self.pred_real = self.loss_dic['gan'].get_loss(
-            self.netD, self.input, self.output_i, self.target_t)
+            self.netD, self.input, self.output_t, self.target_t)
 
         (self.loss_D*self.opt.lambda_gan).backward(retain_graph=True)
 
     def backward_G(self):
         # Make it a tiny bit faster
-        for p in self.netD.parameters():
-            p.requires_grad = False
-        
+        if self.netD is not None:
+            for p in self.netD.parameters():
+                p.requires_grad = False
+
         self.loss_G = 0
         self.loss_CX = None
         self.loss_icnn_pixel = None
         self.loss_icnn_vgg = None
         self.loss_G_GAN = None
+        self.loss_exclusion = None
+        self.loss_ssim = None
+        self.loss_edge = None
+        self.loss_r_pixel = None
 
         if self.opt.lambda_gan > 0:
             self.loss_G_GAN = self.loss_dic['gan'].get_g_loss(
-                self.netD, self.input, self.output_i, self.target_t) #self.pred_real.detach())
+                self.netD, self.input, self.output_t, self.target_t) #self.pred_real.detach())
             self.loss_G += self.loss_G_GAN*self.opt.lambda_gan
-        
+
         if self.aligned:
             self.loss_icnn_pixel = self.loss_dic['t_pixel'].get_loss(
-                self.output_i, self.target_t)
-            
+                self.output_t, self.target_t)
+
             self.loss_icnn_vgg = self.loss_dic['t_vgg'].get_loss(
-                self.output_i, self.target_t)
+                self.output_t, self.target_t)
 
             self.loss_G += self.loss_icnn_pixel+self.loss_icnn_vgg*self.opt.lambda_vgg
+
+            # --- improved losses (aligned data only) ---
+            if self.opt.lambda_exclusion > 0:
+                self.loss_exclusion = self.loss_dic['exclusion'].get_loss(
+                    self.output_t, self.output_r)
+                self.loss_G += self.loss_exclusion * self.opt.lambda_exclusion
+
+            if self.opt.lambda_ssim > 0:
+                self.loss_ssim = self.loss_dic['ssim'].get_loss(
+                    self.output_t, self.target_t)
+                self.loss_G += self.loss_ssim * self.opt.lambda_ssim
+
+            if self.edge_aware_loss is not None:
+                self.loss_edge = self.edge_aware_loss(
+                    self.output_t, self.target_t, self.target_edge)
+                self.loss_G += self.loss_edge * self.opt.lambda_edge
+
+            # Direct R̂ supervision: only meaningful on synthetic data,
+            # because real-data target_r is just a placeholder copy of target_t.
+            if (getattr(self.opt, 'predict_reflection', False)
+                    and getattr(self, 'issyn', False)
+                    and getattr(self, 'target_r', None) is not None
+                    and getattr(self.opt, 'lambda_r_pixel', 0) > 0):
+                self.loss_r_pixel = F.l1_loss(self.output_r, self.target_r)
+                self.loss_G += self.loss_r_pixel * self.opt.lambda_r_pixel
+            # -------------------------------------------
         else:
-            self.loss_CX = self.loss_dic['t_cx'].get_loss(self.output_i, self.target_t)
-            
+            self.loss_CX = self.loss_dic['t_cx'].get_loss(self.output_t, self.target_t)
+
             self.loss_G += self.loss_CX
-        
+
         self.loss_G.backward()
 
     def forward(self):
@@ -317,6 +373,22 @@ class ERRNetModel(ERRNetBase):
         output_i = self.net_i(input_i)
 
         self.output_i = output_i
+
+        # Derive user-facing transmission / reflection depending on prediction mode.
+        # DRNet's up/down-sampling can yield a ±1 pixel mismatch vs input on odd-sized
+        # eval images, so crop both tensors to the common min shape before subtracting.
+        in_h, in_w = self.input.shape[-2:]
+        out_h, out_w = output_i.shape[-2:]
+        h = min(in_h, out_h)
+        w = min(in_w, out_w)
+        in_crop = self.input[..., :h, :w]
+        out_crop = output_i[..., :h, :w]
+        if getattr(self.opt, 'predict_reflection', False):
+            self.output_r = out_crop
+            self.output_t = in_crop - out_crop
+        else:
+            self.output_t = out_crop
+            self.output_r = in_crop - out_crop
 
         return output_i
         
@@ -346,17 +418,33 @@ class ERRNetModel(ERRNetBase):
 
         if self.loss_CX is not None:
             ret_errors['CX'] = self.loss_CX.item()
+        if self.loss_exclusion is not None:
+            ret_errors['Excl'] = self.loss_exclusion.item()
+        if self.loss_ssim is not None:
+            ret_errors['SSIM'] = self.loss_ssim.item()
+        if self.loss_edge is not None:
+            ret_errors['Edge'] = self.loss_edge.item()
+        if getattr(self, 'loss_r_pixel', None) is not None:
+            ret_errors['RPixel'] = self.loss_r_pixel.item()
 
         return ret_errors
 
     def get_current_visuals(self):
         ret_visuals = OrderedDict()
         ret_visuals['input'] = tensor2im(self.input).astype(np.uint8)
-        ret_visuals['output_i'] = tensor2im(self.output_i).astype(np.uint8)        
+        ret_visuals['output_i'] = tensor2im(self.output_i).astype(np.uint8)
         ret_visuals['target'] = tensor2im(self.target_t).astype(np.uint8)
-        ret_visuals['residual'] = tensor2im((self.input - self.output_i)).astype(np.uint8)
+        # Always expose the user-facing T̂ and R̂ derived from the current prediction mode
+        # (both already shape-aligned in forward()).
+        if hasattr(self, 'output_t'):
+            ret_visuals['transmission'] = tensor2im(self.output_t).astype(np.uint8)
+        if hasattr(self, 'output_r'):
+            ret_visuals['reflection'] = tensor2im(self.output_r).astype(np.uint8)
+        # Backward-compat: 'residual' = R̂_implicit. Same as output_r in predict_reflection mode.
+        if hasattr(self, 'output_r'):
+            ret_visuals['residual'] = tensor2im(self.output_r).astype(np.uint8)
 
-        return ret_visuals       
+        return ret_visuals
 
     @staticmethod
     def load(model, resume_epoch=None):
@@ -368,19 +456,27 @@ class ERRNetModel(ERRNetBase):
             state_dict = _torch_load_compat(model_path)
             model.epoch = state_dict['epoch']
             model.iterations = state_dict['iterations']
-            model.net_i.load_state_dict(state_dict['icnn'])
+            missing, unexpected = model.net_i.load_state_dict(state_dict['icnn'], strict=False)
+            if missing:
+                print('[i] Missing keys (will be randomly initialized):', missing)
+            if unexpected:
+                print('[i] Unexpected keys (ignored):', unexpected)
             if model.isTrain:
                 model.optimizer_G.load_state_dict(state_dict['opt_g'])
         else:
             state_dict = _torch_load_compat(icnn_path, map_location=torch.device('cpu'))
-            model.net_i.load_state_dict(state_dict['icnn'])
+            missing, unexpected = model.net_i.load_state_dict(state_dict['icnn'], strict=False)
+            if missing:
+                print('[i] Missing keys (will be randomly initialized):', missing)
+            if unexpected:
+                print('[i] Unexpected keys (ignored):', unexpected)
             model.epoch = state_dict['epoch']
             model.iterations = state_dict['iterations']
             # if model.isTrain:
             #     model.optimizer_G.load_state_dict(state_dict['opt_g'])
 
         if model.isTrain:
-            if 'netD' in state_dict:
+            if 'netD' in state_dict and model.netD is not None:
                 print('Resume netD ...')
                 model.netD.load_state_dict(state_dict['netD'])
                 model.optimizer_D.load_state_dict(state_dict['opt_d'])
